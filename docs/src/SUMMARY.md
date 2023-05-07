@@ -2,4 +2,5 @@
 
 [Introduction](README.md)
 
-- [\[WIP\] The Source Language](language/language.md)
+- [The Source Language](language/README.md)
+- [Lexing and Parsing](lexing-parsing/README.md)
