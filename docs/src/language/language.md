@@ -4,6 +4,40 @@ Our compiler only accepts a small subset of Fortran, its BNF grammar is listed h
 
 ```ebnf
 program ::= items
+items ::= item items | epsilon
+item ::= subroutine | procedure
+
+subroutine ::= "SUBROUTINE" ident "(" formal_param_seq ")" stmt_seq "END"
+procedure ::= ident "FUNCTION" ident "(" formal_param_seq ")" stmt_seq "END"
+formal_param_seq ::= formal_params | empty
+formal_params ::= formal_param "," formal_params | formal_param
+
+stmt_seq ::= stmt stmt_seq | stmt | epsilon
+stmt ::= var_decls | do_stmt | assign | if_stmt
+
+var_decls ::= "INTEGER" var_names | "DOUBLE PRECISION" var_names
+var_names ::= var_name | var_name "," var_names
+var_name ::= ident | ident "(" ident_seq ")"
+ident_seq ::= ident | ident "," ident_seq
+
+do_stmt ::= "DO" ident "=" expr "," expr stmt_seq "ENDDO"
+
+assign ::= expr "=" expr
+
+if_stmt ::= "IF" "(" expr ")" "THEN" stmt_seq "ENDIF"
+        |   "IF" "(" expr ")" "THEN" stmt_seq elseif_stmts "ELSE" stmt_seq "ENDIF"
+
+elseif_stmts ::= "ELSIF"  "(" expr ")" "THEN" stmt_seq
+
+expr ::= simple_expr
+     |   simple_expr ("=" | "!=" | "<" | "<=" | ".GT." | ">=") simple_expr
+simple_expr ::= ["+"|"-"] term {("+"|"-"|".OR.") term}
+term ::= factor {("*"|"/"|"%"|".AND.") factor}
+factor ::= ident_selector | number | "(" expr ")"
+ident_selector ::= ident | ident "(" expr_seq ")"
+expr_seq ::= expr | expr "," expr_seq
+
+ident ::= [a-zA-Z][a-zA-Z0-9]*
 ```
 
 This subset of Fortran is just enough to capture the following running code samples from the
@@ -89,7 +123,7 @@ INTEGER FUNCTION BINARYSEARCH(A, N, L, U, KEY)
         M = (L + U) / 2
         IF (A(M) = KEY) THEN
             BINARYSEARCH = M
-        ELSIF
+        ELSIF (A(M) < KEY) THEN
             BINARYSEARCH = BINARYSEARCH(A, N, L, M - 1, KEY)
         ELSE
             BINARYSEARCH = BINARYSEARCH(A, N, M + 1, U, KEY)
