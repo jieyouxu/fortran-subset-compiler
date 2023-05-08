@@ -38,7 +38,7 @@ impl Default for Span {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Ident {
     pub name: InternedString,
     pub span: Span,

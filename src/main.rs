@@ -2,6 +2,7 @@
 
 mod ast;
 mod lex;
+mod parse;
 mod span;
 
 use lex::lex;
@@ -10,6 +11,8 @@ use clap::Parser as ClapParser;
 use std::io::BufRead;
 use string_interner::StringInterner;
 use tracing::trace;
+
+use crate::parse::Parser;
 
 #[derive(ClapParser)]
 #[command(author, version, about)]
@@ -82,6 +85,19 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     trace!(?input);
     trace!(?output_path);
     trace!(?tokens);
+
+    let ast = match Parser::new(tokens).parse_program() {
+        Ok(ast) => ast,
+        Err(e) => {
+            let diagnostic = Diagnostic::error()
+                .with_message(format!("parser error: {:?}", e))
+                .with_labels(vec![Label::primary(file_id, e.span.lo..e.span.hi)]);
+            term::emit(&mut writer.lock(), &diagnostic_config, &files, &diagnostic)?;
+            std::process::exit(1);
+        }
+    };
+
+    trace!("AST:\n{:#?}", ast);
 
     Ok(())
 }

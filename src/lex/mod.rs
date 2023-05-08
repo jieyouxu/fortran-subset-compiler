@@ -1,4 +1,4 @@
-use std::num::ParseIntError;
+use std::num::{ParseFloatError, ParseIntError};
 use std::ops::Range;
 
 use logos::Logos;
@@ -20,6 +20,7 @@ pub enum LexerErrorKind {
     #[default]
     UnexpectedToken,
     ParseIntError(ParseIntError),
+    ParseFloatError(ParseFloatError),
 }
 
 #[derive(Debug, PartialEq, Clone, Logos, AsRefStr)]
@@ -28,7 +29,9 @@ enum LogosToken<'a> {
     #[regex("[a-zA-Z][a-zA-Z0-9]*")]
     Id(&'a str),
     #[regex("[0-9]+")]
-    Lit(&'a str),
+    IntLit(&'a str),
+    #[regex("[0-9]+.[0-9]+")]
+    DoubleLit(&'a str),
     #[token("SUBROUTINE")]
     Subroutine,
     #[token("(")]
@@ -48,6 +51,8 @@ enum LogosToken<'a> {
     #[token("DO")]
     Do,
     #[token("=")]
+    Assign,
+    #[token("==")]
     Eq,
     #[token("ENDDO")]
     EndDo,
@@ -112,6 +117,18 @@ fn parse_int(src: &str, range: std::ops::Range<usize>) -> Result<i64, LexerError
     }
 }
 
+fn parse_double(src: &str, range: std::ops::Range<usize>) -> Result<f64, LexerError<'_>> {
+    use std::str::FromStr;
+    match f64::from_str(src) {
+        Ok(val) => Ok(val),
+        Err(e) => Err(LexerError {
+            span: Span::new(range.start, range.end),
+            source: src,
+            kind: LexerErrorKind::ParseFloatError(e),
+        }),
+    }
+}
+
 pub fn lex<'src>(
     interner: &mut StringInterner,
     input: &'src str,
@@ -126,9 +143,16 @@ pub fn lex<'src>(
                         LogosToken::Id(name) => {
                             token!(TokenKind::Id(interner.get_or_intern(name)), lexer.span())
                         }
-                        LogosToken::Lit(val) => token!(
+                        LogosToken::IntLit(val) => token!(
                             TokenKind::Lit(Lit {
                                 kind: LitKind::Integer(parse_int(val, lexer.span())?),
+                                symbol: interner.get_or_intern(val)
+                            }),
+                            lexer.span()
+                        ),
+                        LogosToken::DoubleLit(val) => token!(
+                            TokenKind::Lit(Lit {
+                                kind: LitKind::Double(parse_double(val, lexer.span())?),
                                 symbol: interner.get_or_intern(val)
                             }),
                             lexer.span()
@@ -164,6 +188,7 @@ pub fn lex<'src>(
                         LogosToken::Plus => token!(TokenKind::Plus, lexer.span()),
                         LogosToken::Minus => token!(TokenKind::Minus, lexer.span()),
                         LogosToken::Period => token!(TokenKind::Period, lexer.span()),
+                        LogosToken::Assign => token!(TokenKind::Assign, lexer.span()),
                     };
                     tokens.push(token);
                 }
