@@ -1,9 +1,13 @@
 #![feature(let_chains)]
+#![feature(map_try_insert)]
 
 mod ast;
 mod lex;
 mod parse;
+mod session;
 mod span;
+mod typeck;
+mod types;
 
 use lex::lex;
 
@@ -13,6 +17,9 @@ use string_interner::StringInterner;
 use tracing::trace;
 
 use crate::parse::Parser;
+use crate::session::Session;
+use crate::typeck::LowerAst;
+use crate::types::TyCtxt;
 
 #[derive(ClapParser)]
 #[command(author, version, about)]
@@ -98,6 +105,28 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     trace!("AST:\n{:#?}", ast);
+
+    let mut tcx = TyCtxt::new_with_builtin_types();
+    let mut sess = Session::new();
+    let mut type_checker = LowerAst {
+        tcx: &mut tcx,
+        sess: &mut sess,
+        interner: &string_interner,
+    };
+    let hir = match type_checker.lower_program(&ast) {
+        Ok(hir) => hir,
+        Err(_) => {
+            for diag in sess.diagnostics {
+                let diagnostic = Diagnostic::error()
+                    .with_message(format!("typeck error: {:?}", diag))
+                    .with_labels(vec![Label::primary(file_id, diag.span.lo..diag.span.hi)]);
+                term::emit(&mut writer.lock(), &diagnostic_config, &files, &diagnostic)?;
+            }
+            std::process::exit(1);
+        }
+    };
+
+    trace!("HIR:\n{:#?}", hir);
 
     Ok(())
 }

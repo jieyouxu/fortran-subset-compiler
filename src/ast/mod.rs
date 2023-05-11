@@ -97,7 +97,7 @@ pub enum ItemKind {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Procedure {
-    pub name: Ident,
+    pub ident: Ident,
     pub ret_ty: RetTy,
     pub params: Vec<Ident>,
     pub decls: Vec<Decl>,
@@ -126,7 +126,7 @@ pub enum RetTyKind {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Decl {
-    pub name: Ident,
+    pub ident: Ident,
     pub ty: Ty,
     pub span: Span,
 }
@@ -146,7 +146,7 @@ pub enum ScalarTy {
 #[derive(PartialEq, Clone)]
 pub enum Ty {
     Scalar(ScalarTy),
-    Array { base: ScalarTy, bounds: Vec<Ident> },
+    Array { base: ScalarTy, bounds: Vec<Expr> },
 }
 
 impl std::fmt::Debug for Ty {

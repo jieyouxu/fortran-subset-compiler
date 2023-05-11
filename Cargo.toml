@@ -13,7 +13,7 @@ path = "src/main.rs"
 clap = { version = "4.2.4", features = ["derive"] }
 codespan-reporting = "0.11.1"
 indexmap = "1.9.3"
-indextree = "4.6.0"
+indexvec = "0.5.4"
 logos = "0.13.0"
 string-interner = "0.14.0"
 strum = { version = "0.24.1", features = ["derive"] }

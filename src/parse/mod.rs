@@ -138,7 +138,7 @@ impl Parser {
 
         let span = Span::new(ident.span.lo, end_tok.span.hi);
         Ok(Procedure {
-            name: ident,
+            ident,
             ret_ty,
             params,
             decls,
@@ -159,7 +159,7 @@ impl Parser {
 
         let span = Span::new(ident.span.lo, end_tok.span.hi);
         Ok(Procedure {
-            name: ident,
+            ident,
             ret_ty: RetTy {
                 kind: RetTyKind::Unit,
                 span: Span::dummy(),
@@ -267,10 +267,11 @@ impl Parser {
         let ty = if matches!(self.token.kind, TokenKind::LParen) {
             self.expect(&TokenKind::LParen)?;
 
-            let mut bounds = vec![self.parse_ident()?];
+            let mut bounds = vec![self.parse_expr()?];
             while matches!(self.token.kind, TokenKind::Comma) {
                 self.expect(&TokenKind::Comma)?;
-                bounds.push(self.parse_ident()?);
+                let expr = self.parse_expr()?;
+                bounds.push(expr);
             }
 
             let rparen_tok = self.expect(&TokenKind::RParen)?;
@@ -285,7 +286,7 @@ impl Parser {
         };
 
         Ok(Decl {
-            name: ident,
+            ident,
             ty,
             span: ident.span,
         })

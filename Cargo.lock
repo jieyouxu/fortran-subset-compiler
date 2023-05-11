@@ -200,7 +200,7 @@ dependencies = [
  "clap",
  "codespan-reporting",
  "indexmap",
- "indextree",
+ "indexvec",
  "logos",
  "pretty_assertions",
  "string-interner",
@@ -259,10 +259,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "indextree"
-version = "4.6.0"
+name = "indexvec"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c40411d0e5c63ef1323c3d09ce5ec6d84d71531e18daed0743fccea279d7deb6"
+checksum = "f5d833d22493883042f67abfac14e8d6a1b66494998353552c55bd81aa53cfa4"
 
 [[package]]
 name = "io-lifetimes"
