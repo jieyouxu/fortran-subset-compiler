@@ -13,16 +13,12 @@ impl TyCtxt {
     pub fn new_with_builtin_types() -> Self {
         let mut ty_ctxt = Self {
             decls: vec![],
-            types: vec![],
+            types: vec![Type::Unit, Type::Bool, Type::Integer, Type::Double],
         };
-        let unit_id = ty_ctxt.alloc_type(Type::Unit);
-        assert_eq!(unit_id, Self::UNIT_TYPE_ID);
-        let bool_id = ty_ctxt.alloc_type(Type::Bool);
-        assert_eq!(bool_id, Self::BOOL_TYPE_ID);
-        let int_id = ty_ctxt.alloc_type(Type::Integer);
-        assert_eq!(int_id, Self::INTEGER_TYPE_ID);
-        let double_id = ty_ctxt.alloc_type(Type::Double);
-        assert_eq!(double_id, Self::DOUBLE_TYPE_ID);
+        assert_eq!(*ty_ctxt.get_type(Self::UNIT_TYPE_ID), Type::Unit);
+        assert_eq!(*ty_ctxt.get_type(Self::BOOL_TYPE_ID), Type::Bool);
+        assert_eq!(*ty_ctxt.get_type(Self::INTEGER_TYPE_ID), Type::Integer);
+        assert_eq!(*ty_ctxt.get_type(Self::DOUBLE_TYPE_ID), Type::Double);
         ty_ctxt
     }
 
