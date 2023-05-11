@@ -4,6 +4,7 @@ use crate::session::{Diagnostic, DiagnosticKind, Session};
 use crate::span::Ident;
 use crate::types::{Decl, DeclId, TyCtxt, Type, TypeId};
 
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use string_interner::symbol::SymbolU32 as InternedString;
 use string_interner::StringInterner;
@@ -169,7 +170,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
         scope: &mut LexicalScope<'_>,
     ) -> Result<Vec<DeclId>, ()> {
         self.check_duplicate_decls(decls)?;
-        let mut decl_ids = Vec::new();
+        let mut param_decl_map = HashMap::new();
 
         // First pass: register the parameters with primitive types.
         for decl in decls {
@@ -178,12 +179,12 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                     match &decl.ty {
                         Ty::Scalar(..) => {
                             let ty = self.lower_ty_to_ty(&decl.ty, scope)?;
-                            let decl = self.tcx.alloc_decl(Decl {
+                            let decl_id = self.tcx.alloc_decl(Decl {
                                 name: param.name,
                                 ty,
                             });
-                            scope.try_define(param.name, decl)?;
-                            decl_ids.push(decl);
+                            scope.try_define(param.name, decl_id)?;
+                            param_decl_map.insert(decl.ident.name, decl_id);
                         }
                         Ty::Array { .. } => {}
                     }
@@ -198,12 +199,12 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                     match &decl.ty {
                         Ty::Array { .. } => {
                             let ty = self.lower_ty_to_ty(&decl.ty, scope)?;
-                            let decl = self.tcx.alloc_decl(Decl {
+                            let decl_id = self.tcx.alloc_decl(Decl {
                                 name: param.name,
                                 ty,
                             });
-                            scope.try_define(param.name, decl)?;
-                            decl_ids.push(decl);
+                            scope.try_define(param.name, decl_id)?;
+                            param_decl_map.insert(decl.ident.name, decl_id);
                         }
                         Ty::Scalar(..) => {}
                     }
@@ -211,7 +212,13 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
             }
         }
 
-        Ok(decl_ids)
+        let mut ordered_param_decl_ids = Vec::new();
+        for param in params {
+            let decl_id = *param_decl_map.get(&param.name).unwrap();
+            ordered_param_decl_ids.push(decl_id);
+        }
+
+        Ok(ordered_param_decl_ids)
     }
 
     fn check_duplicate_decls(&mut self, decls: &[ast::Decl]) -> Result<(), ()> {
@@ -310,7 +317,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                         }
 
                         for (param_ty, arg) in params.iter().zip(args.iter()) {
-                            if *param_ty != arg.ty {
+                            if !self.tcx.type_equals(*param_ty, arg.ty) {
                                 self.sess.emit_diagnostic(Diagnostic {
                                     kind: DiagnosticKind::ArgumentTypeMismatch {
                                         expected: *param_ty,
@@ -1145,7 +1152,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
             }
         }
 
-        // Second pass: resolve the parameters with non-primitive types
+        // Second pass: resolve the non-param decls with non-primitive types
         for decl in decls {
             if !param_names.contains(&decl.ident.name) {
                 match &decl.ty {

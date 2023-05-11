@@ -72,6 +72,29 @@ impl<'icx> TyCtxt<'icx> {
     pub fn get_type(&self, id: TypeId) -> &Type {
         &self.types[id.0]
     }
+
+    // Check if two types are equal. Note that this recursively checks for *structural* equivalence
+    // for array types and nominal equivalence for procedures.
+    pub fn type_equals(&self, a: TypeId, b: TypeId) -> bool {
+        match (self.get_type(a), self.get_type(b)) {
+            (
+                Type::Array {
+                    base_ty: a_ty,
+                    dimensions: a_dim,
+                },
+                Type::Array {
+                    base_ty: b_ty,
+                    dimensions: b_dim,
+                },
+            ) => self.type_equals(*a_ty, *b_ty) && a_dim == b_dim,
+            (Type::Procedure { .. }, Type::Procedure { .. }) => a == b,
+            (Type::Unit, Type::Unit) => true,
+            (Type::Bool, Type::Bool) => true,
+            (Type::Double, Type::Double) => true,
+            (Type::Integer, Type::Integer) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Copy, Clone, Eq, PartialOrd, Ord)]
