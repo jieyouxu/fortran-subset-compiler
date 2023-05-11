@@ -29,19 +29,41 @@ pub struct Diagnostic {
 pub enum DiagnosticKind {
     DuplicateProcedureDeclaration,
     ParameterTypeUnspecified,
-    UndeclaredVariable,
+    UndeclaredName,
     DuplicateParameterDeclaration,
     DuplicateParameterName,
     DuplicateVariableDeclaration,
-    UnexpectedType { expected: TypeId, found: TypeId },
+    UnexpectedType {
+        expected: TypeId,
+        found: TypeId,
+    },
     UsingArrayNameAsValue,
     UsingProcedureNameAsValue,
     CallOrIndexIntoPrimitiveType,
     NonIntegerBoundExpr,
-    ParamArgCountMismatch { found: usize, expected: usize },
-    ArgumentTypeMismatch { expected: TypeId, found: TypeId },
-    ArrayIndexDimensionMismatch { expected: usize, found: usize },
+    ParamArgCountMismatch {
+        found: usize,
+        expected: usize,
+    },
+    ArgumentTypeMismatch {
+        expected: TypeId,
+        found: TypeId,
+    },
+    ArrayIndexDimensionMismatch {
+        expected: usize,
+        found: usize,
+    },
     NonIntegerIndexExpr,
-    InvalidBinOpExprType { found: TypeId },
+    InvalidBinOpExprType {
+        found: TypeId,
+    },
     NotAssignable,
+    BinOpTypeMismatch {
+        lhs: TypeId,
+        rhs: TypeId,
+    },
+    UnsupportedType {
+        supported: Vec<TypeId>,
+        found: TypeId,
+    },
 }

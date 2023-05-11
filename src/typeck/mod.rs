@@ -7,15 +7,18 @@ use crate::types::{Decl, DeclId, TyCtxt, Type, TypeId};
 use std::collections::{HashMap, HashSet};
 use string_interner::symbol::SymbolU32 as InternedString;
 use string_interner::StringInterner;
+use tracing::trace;
 
 pub mod hir;
 
+#[derive(Debug)]
 struct LexicalScope<'a> {
     kind: LexicalScopeKind,
     names: HashMap<InternedString, DeclId>,
     parent: Option<&'a LexicalScope<'a>>,
 }
 
+#[derive(Debug)]
 enum LexicalScopeKind {
     Regular,
     Procedure,
@@ -23,10 +26,11 @@ enum LexicalScopeKind {
 }
 
 impl<'a> LexicalScope<'a> {
-    fn global() -> Self {
+    fn global(interner: &mut StringInterner) -> Self {
         Self {
             kind: LexicalScopeKind::Global,
-            names: Default::default(),
+            // Predefined decls
+            names: HashMap::from_iter([(interner.get_or_intern("DABS"), TyCtxt::DABS_DECL_ID)]),
             parent: None,
         }
     }
@@ -60,15 +64,14 @@ impl<'a> LexicalScope<'a> {
 }
 
 pub struct LowerAst<'tcx, 'sess, 'icx> {
-    pub tcx: &'tcx mut TyCtxt,
+    pub tcx: &'tcx mut TyCtxt<'icx>,
     pub sess: &'sess mut Session,
-    pub interner: &'icx StringInterner,
 }
 
 impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
     pub fn lower_program(&mut self, program: &Program) -> Result<hir::Program, ()> {
         let mut items = Vec::new();
-        let mut scope = LexicalScope::global();
+        let mut scope = LexicalScope::global(&mut self.tcx.interner);
         for item in &program.items {
             items.push(self.lower_item(item, &mut scope)?);
         }
@@ -95,8 +98,12 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
         procedure: &Procedure,
         scope: &mut LexicalScope<'_>,
     ) -> Result<hir::Procedure, ()> {
+        trace!(
+            "lower_procedure: procedure = {}",
+            self.tcx.interner.resolve(procedure.ident.name).unwrap()
+        );
         let ret_ty = self.lower_ret_ty(&procedure.ret_ty)?;
-        // Need 2 passes on params: one pass to collect param names with their type decls and
+        // Need 2 passes on params: one pass to collect param types and
         // another pass to actually register the params under nested scope.
         let mut dummy_scope = LexicalScope::procedure(scope);
         let params = self.lower_params(&procedure.params, &procedure.decls, &mut dummy_scope)?;
@@ -125,12 +132,16 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
         let mut procedure_scope = LexicalScope::procedure(scope);
         let params =
             self.lower_params(&procedure.params, &procedure.decls, &mut procedure_scope)?;
+        trace!(?params);
         let decls = self.process_non_param_decls(
             &procedure.decls,
             &procedure.params,
             &mut procedure_scope,
         )?;
+        trace!(?decls);
         let stmts = self.lower_stmts(&procedure.stmts, &mut procedure_scope)?;
+
+        trace!(?stmts);
 
         Ok(hir::Procedure {
             sig,
@@ -157,86 +168,68 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
         decls: &[ast::Decl],
         scope: &mut LexicalScope<'_>,
     ) -> Result<Vec<DeclId>, ()> {
-        let mut unique_param = HashSet::new();
-        let mut unique_param_names = HashSet::new();
-        for param in params {
-            if unique_param_names.contains(&param.name) {
-                self.sess.emit_diagnostic(Diagnostic {
-                    kind: DiagnosticKind::DuplicateParameterName,
-                    message: format!(
-                        "duplicate parameter name: `{}`",
-                        self.interner.resolve(param.name).unwrap()
-                    ),
-                    span: param.span,
-                });
-                return Err(());
-            } else {
-                unique_param.insert(*param);
-                unique_param_names.insert(param.name);
-            }
-        }
+        self.check_duplicate_decls(decls)?;
+        let mut decl_ids = Vec::new();
 
-        let mut param_decl_map = HashMap::<Ident, DeclId>::new();
-
-        for candidate_decl in decls {
-            if unique_param_names.contains(&candidate_decl.ident.name) {
-                // The candidate decl has the same name.
-                if param_decl_map
-                    .keys()
-                    .any(|k| k.name == candidate_decl.ident.name)
-                {
-                    // Uh-oh, we already have a param decl of the same name!
-                    self.sess.emit_diagnostic(Diagnostic {
-                        kind: DiagnosticKind::DuplicateParameterDeclaration,
-                        message: format!(
-                            "`{}` has already been ascribed a type",
-                            self.interner.resolve(candidate_decl.ident.name).unwrap()
-                        ),
-                        span: candidate_decl.span,
-                    });
-                    return Err(());
-                } else {
-                    let ty = self.lower_ty_to_ty(&candidate_decl.ty, scope)?;
-                    let decl = self.tcx.alloc_decl(Decl {
-                        name: candidate_decl.ident.name,
-                        ty,
-                    });
-
-                    if scope.try_define(candidate_decl.ident.name, decl).is_err() {
-                        self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::DuplicateParameterDeclaration,
-                            message: format!(
-                                "parameter `{}` already defined",
-                                self.interner.resolve(candidate_decl.ident.name).unwrap()
-                            ),
-                            span: candidate_decl.ident.span,
-                        });
-                        return Err(());
+        // First pass: register the parameters with primitive types.
+        for decl in decls {
+            for param in params {
+                if decl.ident.name == param.name {
+                    match &decl.ty {
+                        Ty::Scalar(..) => {
+                            let ty = self.lower_ty_to_ty(&decl.ty, scope)?;
+                            let decl = self.tcx.alloc_decl(Decl {
+                                name: param.name,
+                                ty,
+                            });
+                            scope.try_define(param.name, decl)?;
+                            decl_ids.push(decl);
+                        }
+                        Ty::Array { .. } => {}
                     }
-
-                    param_decl_map.insert(candidate_decl.ident, decl);
                 }
             }
         }
 
-        if param_decl_map.len() < unique_param.len() {
-            // Uh-oh, we have some parameters who has not been defined with a type!
-            let defined_params = HashSet::from_iter(param_decl_map.keys().cloned());
-            let params_missing_decls = &unique_param - &defined_params;
-            for missing_decl in params_missing_decls {
-                self.sess.emit_diagnostic(Diagnostic {
-                    kind: DiagnosticKind::ParameterTypeUnspecified,
-                    message: format!(
-                        "missing type definition for parameter `{}`",
-                        self.interner.resolve(missing_decl.name).unwrap()
-                    ),
-                    span: missing_decl.span,
-                })
+        // Second pass: resolve the parameters with non-primitive types
+        for decl in decls {
+            for param in params {
+                if decl.ident.name == param.name {
+                    match &decl.ty {
+                        Ty::Array { .. } => {
+                            let ty = self.lower_ty_to_ty(&decl.ty, scope)?;
+                            let decl = self.tcx.alloc_decl(Decl {
+                                name: param.name,
+                                ty,
+                            });
+                            scope.try_define(param.name, decl)?;
+                            decl_ids.push(decl);
+                        }
+                        Ty::Scalar(..) => {}
+                    }
+                }
             }
-            return Err(());
         }
 
-        Ok(param_decl_map.values().copied().collect())
+        Ok(decl_ids)
+    }
+
+    fn check_duplicate_decls(&mut self, decls: &[ast::Decl]) -> Result<(), ()> {
+        let mut unique_decl_names = HashSet::new();
+        for decl in decls {
+            if !unique_decl_names.insert(decl.ident.name) {
+                self.sess.emit_diagnostic(Diagnostic {
+                    kind: DiagnosticKind::DuplicateVariableDeclaration,
+                    message: format!(
+                        "variable or parameter `{}` already defined",
+                        self.tcx.interner.resolve(decl.ident.name).unwrap()
+                    ),
+                    span: decl.ident.span,
+                });
+                return Err(());
+            }
+        }
+        Ok(())
     }
 
     fn lower_ty_to_ty(&mut self, ty: &Ty, scope: &mut LexicalScope<'_>) -> Result<TypeId, ()> {
@@ -278,7 +271,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 (hir::ExprKind::DoubleConst(*val), TyCtxt::DOUBLE_TYPE_ID)
             }
             ExprKind::Fetch(ident) => {
-                let decl = self.lower_non_call_or_index_ident(*ident, scope)?;
+                let decl = self.lower_ident(*ident, scope)?;
                 let ty = self.tcx.get_decl(decl).ty;
                 (hir::ExprKind::Fetch(decl), ty)
             }
@@ -290,6 +283,16 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
 
                 match &target_ty {
                     Type::Procedure { params, ret_ty } => {
+                        trace!(?target_ty);
+                        trace!(
+                            "param types {:?} => {:?}",
+                            params,
+                            params
+                                .iter()
+                                .map(|p| self.tcx.get_type(*p))
+                                .collect::<Vec<_>>()
+                        );
+
                         if params.len() != args.len() {
                             self.sess.emit_diagnostic(Diagnostic {
                                 kind: DiagnosticKind::ParamArgCountMismatch {
@@ -443,202 +446,214 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Greater => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Greater, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Greater, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
+                    } else {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
                                 found: a.ty,
                             },
                             message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(a.ty)
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
                             ),
-                            span: a.span,
+                            span: expr.span,
                         });
                         return Err(());
                     }
-
-                    if b.ty != TyCtxt::INTEGER_TYPE_ID {
-                        self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
-                                found: b.ty,
-                            },
-                            message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(b.ty)
-                            ),
-                            span: b.span,
-                        });
-                    }
-
-                    (
-                        hir::ExprKind::Binary(hir::BinOp::Greater, Box::new(a), Box::new(b)),
-                        TyCtxt::BOOL_TYPE_ID,
-                    )
                 }
                 BinOp::Less => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Less, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Less, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
+                    } else {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
                                 found: a.ty,
                             },
                             message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(a.ty)
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
                             ),
-                            span: a.span,
+                            span: expr.span,
                         });
                         return Err(());
                     }
-
-                    if b.ty != TyCtxt::INTEGER_TYPE_ID {
-                        self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
-                                found: b.ty,
-                            },
-                            message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(b.ty)
-                            ),
-                            span: b.span,
-                        });
-                    }
-
-                    (
-                        hir::ExprKind::Binary(hir::BinOp::Less, Box::new(a), Box::new(b)),
-                        TyCtxt::BOOL_TYPE_ID,
-                    )
                 }
                 BinOp::Geq => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Geq, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Geq, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
+                    } else {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
                                 found: a.ty,
                             },
                             message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(a.ty)
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
                             ),
-                            span: a.span,
+                            span: expr.span,
                         });
                         return Err(());
                     }
-
-                    if b.ty != TyCtxt::INTEGER_TYPE_ID {
-                        self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
-                                found: b.ty,
-                            },
-                            message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(b.ty)
-                            ),
-                            span: b.span,
-                        });
-                    }
-
-                    (
-                        hir::ExprKind::Binary(hir::BinOp::Geq, Box::new(a), Box::new(b)),
-                        TyCtxt::BOOL_TYPE_ID,
-                    )
                 }
                 BinOp::Leq => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Leq, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Leq, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
+                    } else {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
                                 found: a.ty,
                             },
                             message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(a.ty)
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
                             ),
-                            span: a.span,
+                            span: expr.span,
                         });
                         return Err(());
                     }
-
-                    if b.ty != TyCtxt::INTEGER_TYPE_ID {
-                        self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
-                                found: b.ty,
-                            },
-                            message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(b.ty)
-                            ),
-                            span: b.span,
-                        });
-                    }
-
-                    (
-                        hir::ExprKind::Binary(hir::BinOp::Leq, Box::new(a), Box::new(b)),
-                        TyCtxt::BOOL_TYPE_ID,
-                    )
                 }
                 BinOp::And => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID {
-                        if b.ty == TyCtxt::INTEGER_TYPE_ID {
-                            (
-                                hir::ExprKind::Binary(hir::BinOp::And, Box::new(a), Box::new(b)),
-                                TyCtxt::INTEGER_TYPE_ID,
-                            )
-                        } else {
-                            self.sess.emit_diagnostic(Diagnostic {
-                                kind: DiagnosticKind::UnexpectedType {
-                                    expected: TyCtxt::INTEGER_TYPE_ID,
-                                    found: b.ty,
-                                },
-                                message: format!(
-                                    "expected int type but found `{:?}`",
-                                    self.tcx.get_type(b.ty)
-                                ),
-                                span: a.span,
-                            });
-                            return Err(());
-                        }
-                    } else if a.ty == TyCtxt::BOOL_TYPE_ID {
-                        if b.ty == TyCtxt::BOOL_TYPE_ID {
-                            (
-                                hir::ExprKind::Binary(hir::BinOp::And, Box::new(a), Box::new(b)),
-                                TyCtxt::BOOL_TYPE_ID,
-                            )
-                        } else {
-                            self.sess.emit_diagnostic(Diagnostic {
-                                kind: DiagnosticKind::UnexpectedType {
-                                    expected: TyCtxt::BOOL_TYPE_ID,
-                                    found: b.ty,
-                                },
-                                message: format!(
-                                    "expected bool type but found `{:?}`",
-                                    self.tcx.get_type(b.ty)
-                                ),
-                                span: a.span,
-                            });
-                            return Err(());
-                        }
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::And, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::And, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::BOOL_TYPE_ID && b.ty == TyCtxt::BOOL_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::And, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
                     } else {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::InvalidBinOpExprType { found: a.ty },
-                            message:
-                                "AND operator can only be applied to integer or bool expressions"
-                                    .to_owned(),
-                            span: a.span,
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
+                                found: a.ty,
+                            },
+                            message: format!(
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
+                            ),
+                            span: expr.span,
                         });
                         return Err(());
                     }
@@ -646,54 +661,46 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Or => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID {
-                        if b.ty == TyCtxt::INTEGER_TYPE_ID {
-                            (
-                                hir::ExprKind::Binary(hir::BinOp::Or, Box::new(a), Box::new(b)),
-                                TyCtxt::INTEGER_TYPE_ID,
-                            )
-                        } else {
-                            self.sess.emit_diagnostic(Diagnostic {
-                                kind: DiagnosticKind::UnexpectedType {
-                                    expected: TyCtxt::INTEGER_TYPE_ID,
-                                    found: b.ty,
-                                },
-                                message: format!(
-                                    "expected int type but found `{:?}`",
-                                    self.tcx.get_type(b.ty)
-                                ),
-                                span: a.span,
-                            });
-                            return Err(());
-                        }
-                    } else if a.ty == TyCtxt::BOOL_TYPE_ID {
-                        if b.ty == TyCtxt::BOOL_TYPE_ID {
-                            (
-                                hir::ExprKind::Binary(hir::BinOp::Or, Box::new(a), Box::new(b)),
-                                TyCtxt::BOOL_TYPE_ID,
-                            )
-                        } else {
-                            self.sess.emit_diagnostic(Diagnostic {
-                                kind: DiagnosticKind::UnexpectedType {
-                                    expected: TyCtxt::BOOL_TYPE_ID,
-                                    found: b.ty,
-                                },
-                                message: format!(
-                                    "expected bool type but found `{:?}`",
-                                    self.tcx.get_type(b.ty)
-                                ),
-                                span: a.span,
-                            });
-                            return Err(());
-                        }
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Or, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Or, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::BOOL_TYPE_ID && b.ty == TyCtxt::BOOL_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Or, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
                     } else {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::InvalidBinOpExprType { found: a.ty },
-                            message:
-                                "OR operator can only be applied to integer or bool expressions"
-                                    .to_owned(),
-                            span: a.span,
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
+                                found: a.ty,
+                            },
+                            message: format!(
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
+                            ),
+                            span: expr.span,
                         });
                         return Err(());
                     }
@@ -701,54 +708,46 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Eq => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID {
-                        if b.ty == TyCtxt::INTEGER_TYPE_ID {
-                            (
-                                hir::ExprKind::Binary(hir::BinOp::Eq, Box::new(a), Box::new(b)),
-                                TyCtxt::BOOL_TYPE_ID,
-                            )
-                        } else {
-                            self.sess.emit_diagnostic(Diagnostic {
-                                kind: DiagnosticKind::UnexpectedType {
-                                    expected: TyCtxt::INTEGER_TYPE_ID,
-                                    found: b.ty,
-                                },
-                                message: format!(
-                                    "expected int type but found `{:?}`",
-                                    self.tcx.get_type(b.ty)
-                                ),
-                                span: a.span,
-                            });
-                            return Err(());
-                        }
-                    } else if a.ty == TyCtxt::BOOL_TYPE_ID {
-                        if b.ty == TyCtxt::BOOL_TYPE_ID {
-                            (
-                                hir::ExprKind::Binary(hir::BinOp::Eq, Box::new(a), Box::new(b)),
-                                TyCtxt::BOOL_TYPE_ID,
-                            )
-                        } else {
-                            self.sess.emit_diagnostic(Diagnostic {
-                                kind: DiagnosticKind::UnexpectedType {
-                                    expected: TyCtxt::BOOL_TYPE_ID,
-                                    found: b.ty,
-                                },
-                                message: format!(
-                                    "expected bool type but found `{:?}`",
-                                    self.tcx.get_type(b.ty)
-                                ),
-                                span: a.span,
-                            });
-                            return Err(());
-                        }
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Eq, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Eq, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::BOOL_TYPE_ID && b.ty == TyCtxt::BOOL_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Eq, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
                     } else {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::InvalidBinOpExprType { found: a.ty },
-                            message:
-                                "== operator can only be applied to integer or bool expressions"
-                                    .to_owned(),
-                            span: a.span,
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
+                                found: a.ty,
+                            },
+                            message: format!(
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
+                            ),
+                            span: expr.span,
                         });
                         return Err(());
                     }
@@ -756,54 +755,46 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Neq => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID {
-                        if b.ty == TyCtxt::INTEGER_TYPE_ID {
-                            (
-                                hir::ExprKind::Binary(hir::BinOp::Neq, Box::new(a), Box::new(b)),
-                                TyCtxt::BOOL_TYPE_ID,
-                            )
-                        } else {
-                            self.sess.emit_diagnostic(Diagnostic {
-                                kind: DiagnosticKind::UnexpectedType {
-                                    expected: TyCtxt::INTEGER_TYPE_ID,
-                                    found: b.ty,
-                                },
-                                message: format!(
-                                    "expected int type but found `{:?}`",
-                                    self.tcx.get_type(b.ty)
-                                ),
-                                span: a.span,
-                            });
-                            return Err(());
-                        }
-                    } else if a.ty == TyCtxt::BOOL_TYPE_ID {
-                        if b.ty == TyCtxt::BOOL_TYPE_ID {
-                            (
-                                hir::ExprKind::Binary(hir::BinOp::Neq, Box::new(a), Box::new(b)),
-                                TyCtxt::BOOL_TYPE_ID,
-                            )
-                        } else {
-                            self.sess.emit_diagnostic(Diagnostic {
-                                kind: DiagnosticKind::UnexpectedType {
-                                    expected: TyCtxt::BOOL_TYPE_ID,
-                                    found: b.ty,
-                                },
-                                message: format!(
-                                    "expected bool type but found `{:?}`",
-                                    self.tcx.get_type(b.ty)
-                                ),
-                                span: a.span,
-                            });
-                            return Err(());
-                        }
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Neq, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Neq, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::BOOL_TYPE_ID && b.ty == TyCtxt::BOOL_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Neq, Box::new(a), Box::new(b)),
+                            TyCtxt::BOOL_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
                     } else {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::InvalidBinOpExprType { found: a.ty },
-                            message:
-                                "!= operator can only be applied to integer or bool expressions"
-                                    .to_owned(),
-                            span: a.span,
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
+                                found: a.ty,
+                            },
+                            message: format!(
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
+                            ),
+                            span: expr.span,
                         });
                         return Err(());
                     }
@@ -811,187 +802,212 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Add => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Add, Box::new(a), Box::new(b)),
+                            TyCtxt::INTEGER_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Add, Box::new(a), Box::new(b)),
+                            TyCtxt::DOUBLE_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
+                    } else {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
                                 found: a.ty,
                             },
                             message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(a.ty)
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
                             ),
-                            span: a.span,
+                            span: expr.span,
                         });
                         return Err(());
                     }
-
-                    if b.ty != TyCtxt::INTEGER_TYPE_ID {
-                        self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
-                                found: b.ty,
-                            },
-                            message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(b.ty)
-                            ),
-                            span: b.span,
-                        });
-                    }
-
-                    (
-                        hir::ExprKind::Binary(hir::BinOp::Add, Box::new(a), Box::new(b)),
-                        TyCtxt::INTEGER_TYPE_ID,
-                    )
                 }
                 BinOp::Sub => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Sub, Box::new(a), Box::new(b)),
+                            TyCtxt::INTEGER_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Sub, Box::new(a), Box::new(b)),
+                            TyCtxt::DOUBLE_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
+                    } else {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
                                 found: a.ty,
                             },
                             message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(a.ty)
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
                             ),
-                            span: a.span,
+                            span: expr.span,
                         });
                         return Err(());
                     }
-
-                    if b.ty != TyCtxt::INTEGER_TYPE_ID {
-                        self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
-                                found: b.ty,
-                            },
-                            message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(b.ty)
-                            ),
-                            span: b.span,
-                        });
-                    }
-
-                    (
-                        hir::ExprKind::Binary(hir::BinOp::Sub, Box::new(a), Box::new(b)),
-                        TyCtxt::INTEGER_TYPE_ID,
-                    )
                 }
                 BinOp::Mul => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Mul, Box::new(a), Box::new(b)),
+                            TyCtxt::INTEGER_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Mul, Box::new(a), Box::new(b)),
+                            TyCtxt::DOUBLE_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
+                    } else {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
                                 found: a.ty,
                             },
                             message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(a.ty)
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
                             ),
-                            span: a.span,
+                            span: expr.span,
                         });
                         return Err(());
                     }
-
-                    if b.ty != TyCtxt::INTEGER_TYPE_ID {
-                        self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
-                                found: b.ty,
-                            },
-                            message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(b.ty)
-                            ),
-                            span: b.span,
-                        });
-                    }
-
-                    (
-                        hir::ExprKind::Binary(hir::BinOp::Mul, Box::new(a), Box::new(b)),
-                        TyCtxt::INTEGER_TYPE_ID,
-                    )
                 }
                 BinOp::Div => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Div, Box::new(a), Box::new(b)),
+                            TyCtxt::INTEGER_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Div, Box::new(a), Box::new(b)),
+                            TyCtxt::DOUBLE_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
+                    } else {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
                                 found: a.ty,
                             },
                             message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(a.ty)
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
                             ),
-                            span: a.span,
+                            span: expr.span,
                         });
                         return Err(());
                     }
-
-                    if b.ty != TyCtxt::INTEGER_TYPE_ID {
-                        self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
-                                found: b.ty,
-                            },
-                            message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(b.ty)
-                            ),
-                            span: b.span,
-                        });
-                    }
-
-                    (
-                        hir::ExprKind::Binary(hir::BinOp::Div, Box::new(a), Box::new(b)),
-                        TyCtxt::INTEGER_TYPE_ID,
-                    )
                 }
                 BinOp::Mod => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Mod, Box::new(a), Box::new(b)),
+                            TyCtxt::INTEGER_TYPE_ID,
+                        )
+                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                        (
+                            hir::ExprKind::Binary(hir::BinOp::Mod, Box::new(a), Box::new(b)),
+                            TyCtxt::DOUBLE_TYPE_ID,
+                        )
+                    } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
+                            kind: DiagnosticKind::BinOpTypeMismatch {
+                                lhs: a.ty,
+                                rhs: b.ty,
+                            },
+                            message: format!(
+                                "binary operation LHS expression has type `{:?}` but RHS expression has `{:?}`",
+                                self.tcx.get_type(a.ty),
+                                self.tcx.get_type(b.ty)
+                            ),
+                            span: expr.span,
+                        });
+                        return Err(());
+                    } else {
+                        self.sess.emit_diagnostic(Diagnostic {
+                            kind: DiagnosticKind::UnsupportedType {
+                                supported: vec![],
                                 found: a.ty,
                             },
                             message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(a.ty)
+                                "binary operation has unsupported type `{:?}`",
+                                self.tcx.get_type(a.ty),
                             ),
-                            span: a.span,
+                            span: expr.span,
                         });
                         return Err(());
                     }
-
-                    if b.ty != TyCtxt::INTEGER_TYPE_ID {
-                        self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
-                                found: b.ty,
-                            },
-                            message: format!(
-                                "unexpected type: expected int but found `{:?}`",
-                                self.tcx.get_type(b.ty)
-                            ),
-                            span: b.span,
-                        });
-                    }
-
-                    (
-                        hir::ExprKind::Binary(hir::BinOp::Mod, Box::new(a), Box::new(b)),
-                        TyCtxt::INTEGER_TYPE_ID,
-                    )
                 }
             },
         };
@@ -1017,7 +1033,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                         kind: DiagnosticKind::UsingProcedureNameAsValue,
                         message: format!(
                             "cannot use procedure name `{}` as value",
-                            self.interner.resolve(ident.name).unwrap()
+                            self.tcx.interner.resolve(ident.name).unwrap()
                         ),
                         span: ident.span,
                     });
@@ -1028,7 +1044,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                         kind: DiagnosticKind::UsingArrayNameAsValue,
                         message: format!(
                             "cannot use array name `{}` as value",
-                            self.interner.resolve(ident.name).unwrap()
+                            self.tcx.interner.resolve(ident.name).unwrap()
                         ),
                         span: ident.span,
                     });
@@ -1038,10 +1054,10 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
             }
         } else {
             self.sess.emit_diagnostic(Diagnostic {
-                kind: DiagnosticKind::UndeclaredVariable,
+                kind: DiagnosticKind::UndeclaredName,
                 message: format!(
-                    "use of undefined variable `{}`",
-                    self.interner.resolve(ident.name).unwrap()
+                    "use of undefined name `{}`",
+                    self.tcx.interner.resolve(ident.name).unwrap()
                 ),
                 span: ident.span,
             });
@@ -1054,6 +1070,12 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
         ident: Ident,
         scope: &mut LexicalScope<'_>,
     ) -> Result<DeclId, ()> {
+        trace!(
+            "lower_call_or_index_ident: ident.name = {:?}, resolved = {}",
+            ident.name,
+            self.tcx.interner.resolve(ident.name).unwrap()
+        );
+        trace!("lower_call_or_index_ident: scope:\n{:#?}", scope);
         if let Some(decl_id) = scope.lookup(ident.name) {
             let decl = self.tcx.get_decl(decl_id);
             let ty = self.tcx.get_type(decl.ty);
@@ -1064,7 +1086,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                         kind: DiagnosticKind::CallOrIndexIntoPrimitiveType,
                         message: format!(
                             "cannot call or index into variable of primitive type `{}`",
-                            self.interner.resolve(ident.name).unwrap()
+                            self.tcx.interner.resolve(ident.name).unwrap()
                         ),
                         span: ident.span,
                     });
@@ -1073,10 +1095,10 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
             }
         } else {
             self.sess.emit_diagnostic(Diagnostic {
-                kind: DiagnosticKind::UndeclaredVariable,
+                kind: DiagnosticKind::UndeclaredName,
                 message: format!(
-                    "use of undefined variable `{}`",
-                    self.interner.resolve(ident.name).unwrap()
+                    "use of undefined name `{}`",
+                    self.tcx.interner.resolve(ident.name).unwrap()
                 ),
                 span: ident.span,
             });
@@ -1102,33 +1124,43 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
         params: &[Ident],
         scope: &mut LexicalScope<'_>,
     ) -> Result<Vec<DeclId>, ()> {
-        let param_names = HashSet::<InternedString>::from_iter(params.iter().map(|p| p.name));
-        let mut decl_ty_map = HashMap::new();
+        let mut decl_ids = Vec::new();
+        let param_names = params.iter().map(|p| p.name).collect::<Vec<_>>();
 
+        // First pass: register the non-param decls with primitive types.
         for decl in decls {
             if !param_names.contains(&decl.ident.name) {
-                let ty = self.lower_ty_to_ty(&decl.ty, scope)?;
-                match decl_ty_map.try_insert(decl.ident.name, ty) {
-                    Ok(_) => {}
-                    Err(_) => {
-                        self.sess.emit_diagnostic(Diagnostic {
-                            kind: DiagnosticKind::DuplicateVariableDeclaration,
-                            message: format!(
-                                "variable `{}` is already declared",
-                                self.interner.resolve(decl.ident.name).unwrap()
-                            ),
-                            span: decl.span,
+                match &decl.ty {
+                    Ty::Scalar(..) => {
+                        let ty = self.lower_ty_to_ty(&decl.ty, scope)?;
+                        let decl_id = self.tcx.alloc_decl(Decl {
+                            name: decl.ident.name,
+                            ty,
                         });
-                        return Err(());
+                        scope.try_define(decl.ident.name, decl_id)?;
+                        decl_ids.push(decl_id);
                     }
+                    Ty::Array { .. } => {}
                 }
             }
         }
 
-        let mut decl_ids = Vec::new();
-        for (name, ty) in decl_ty_map {
-            let decl_id = self.tcx.alloc_decl(Decl { name, ty });
-            decl_ids.push(decl_id);
+        // Second pass: resolve the parameters with non-primitive types
+        for decl in decls {
+            if !param_names.contains(&decl.ident.name) {
+                match &decl.ty {
+                    Ty::Array { .. } => {
+                        let ty = self.lower_ty_to_ty(&decl.ty, scope)?;
+                        let decl_id = self.tcx.alloc_decl(Decl {
+                            name: decl.ident.name,
+                            ty,
+                        });
+                        scope.try_define(decl.ident.name, decl_id)?;
+                        decl_ids.push(decl_id);
+                    }
+                    Ty::Scalar(..) => {}
+                }
+            }
         }
 
         Ok(decl_ids)
@@ -1231,7 +1263,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 let target_ty = self.tcx.get_type(target_decl.ty);
 
                 match &target_ty {
-                    Type::Procedure { params, ret_ty } => {
+                    Type::Procedure { .. } => {
                         self.sess.emit_diagnostic(Diagnostic {
                             kind: DiagnosticKind::NotAssignable,
                             message: "cannot assign to call expression".to_owned(),
@@ -1293,10 +1325,10 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
     fn lower_ident(&mut self, ident: Ident, scope: &mut LexicalScope<'_>) -> Result<DeclId, ()> {
         scope.lookup(ident.name).ok_or_else(|| {
             self.sess.emit_diagnostic(Diagnostic {
-                kind: DiagnosticKind::UndeclaredVariable,
+                kind: DiagnosticKind::UndeclaredName,
                 message: format!(
                     "cannot find `{}` in current scope",
-                    self.interner.resolve(ident.name).unwrap()
+                    self.tcx.interner.resolve(ident.name).unwrap()
                 ),
                 span: ident.span,
             });

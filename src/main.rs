@@ -106,12 +106,11 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     trace!("AST:\n{:#?}", ast);
 
-    let mut tcx = TyCtxt::new_with_builtin_types();
+    let mut tcx = TyCtxt::new_with_builtin_types_and_functions(&mut string_interner);
     let mut sess = Session::new();
     let mut type_checker = LowerAst {
         tcx: &mut tcx,
         sess: &mut sess,
-        interner: &string_interner,
     };
     let hir = match type_checker.lower_program(&ast) {
         Ok(hir) => hir,
