@@ -1,5 +1,7 @@
+use index_vec::IndexVec;
 pub use string_interner::symbol::SymbolU32 as InternedString;
 use string_interner::StringInterner;
+use tracing::debug;
 
 pub use crate::typeck::hir;
 
@@ -7,70 +9,82 @@ pub use crate::typeck::hir;
 #[derive(Debug, PartialEq)]
 pub struct TyCtxt<'icx> {
     pub interner: &'icx mut StringInterner,
-    pub decls: Vec<Decl>,
-    pub types: Vec<Type>,
+    pub decls: IndexVec<DeclId, Decl>,
+    pub types: IndexVec<TypeId, Type>,
 }
 
 impl<'icx> TyCtxt<'icx> {
     pub fn new_with_builtin_types_and_functions(interner: &'icx mut StringInterner) -> Self {
         let mut ty_ctxt = Self {
             interner,
-            decls: vec![],
-            types: vec![Type::Unit, Type::Bool, Type::Integer, Type::Double],
+            decls: Default::default(),
+            types: Default::default(),
         };
 
-        assert_eq!(*ty_ctxt.get_type(Self::UNIT_TYPE_ID), Type::Unit);
-        assert_eq!(*ty_ctxt.get_type(Self::BOOL_TYPE_ID), Type::Bool);
-        assert_eq!(*ty_ctxt.get_type(Self::INTEGER_TYPE_ID), Type::Integer);
-        assert_eq!(*ty_ctxt.get_type(Self::DOUBLE_TYPE_ID), Type::Double);
+        let unit_type_id = ty_ctxt.types.push(Type::Unit);
+        let bool_type_id = ty_ctxt.types.push(Type::Bool);
+        let integer_type_id = ty_ctxt.types.push(Type::Integer);
+        let double_type_id = ty_ctxt.types.push(Type::Double);
+
+        assert_eq!(*ty_ctxt.get_type(ty_ctxt.unit_type()), Type::Unit);
+        assert_eq!(*ty_ctxt.get_type(ty_ctxt.bool_type()), Type::Bool);
+        assert_eq!(*ty_ctxt.get_type(ty_ctxt.integer_type()), Type::Integer);
+        assert_eq!(*ty_ctxt.get_type(ty_ctxt.double_type()), Type::Double);
 
         let dabs = Decl {
             name: ty_ctxt.interner.get_or_intern("DABS"),
             ty: ty_ctxt.alloc_type(Type::Procedure {
-                params: vec![Self::DOUBLE_TYPE_ID],
-                ret_ty: Self::DOUBLE_TYPE_ID,
+                params: vec![ty_ctxt.double_type()],
+                ret_ty: ty_ctxt.double_type(),
             }),
         };
         ty_ctxt.alloc_decl(dabs);
 
-        assert_eq!(*ty_ctxt.get_decl(Self::DABS_DECL_ID), dabs);
+        assert_eq!(*ty_ctxt.get_decl(ty_ctxt.dabs_decl()), dabs);
 
         ty_ctxt
     }
 
-    pub const UNIT_TYPE_ID: TypeId = TypeId(0);
-    pub const BOOL_TYPE_ID: TypeId = TypeId(1);
-    pub const INTEGER_TYPE_ID: TypeId = TypeId(2);
-    pub const DOUBLE_TYPE_ID: TypeId = TypeId(3);
+    pub fn unit_type(&self) -> TypeId {
+        TypeId::new(0)
+    }
 
-    pub const DABS_DECL_ID: DeclId = DeclId(0);
+    pub fn bool_type(&self) -> TypeId {
+        TypeId::new(1)
+    }
+
+    pub fn integer_type(&self) -> TypeId {
+        TypeId::new(2)
+    }
+
+    pub fn double_type(&self) -> TypeId {
+        TypeId::new(3)
+    }
+
+    pub fn dabs_decl(&self) -> DeclId {
+        DeclId::new(0)
+    }
 
     pub fn alloc_decl(&mut self, decl: Decl) -> DeclId {
-        let id = DeclId(self.decls.len());
-        self.decls.push(decl);
-        id
+        self.decls.push(decl)
     }
 
     pub fn get_decl(&self, id: DeclId) -> &Decl {
-        &self.decls[id.0]
+        &self.decls[id]
     }
 
     pub fn alloc_type(&mut self, ty: Type) -> TypeId {
         match ty {
-            Type::Procedure { .. } | Type::Array { .. } => {
-                let id = TypeId(self.types.len());
-                self.types.push(ty);
-                id
-            }
-            Type::Bool => Self::BOOL_TYPE_ID,
-            Type::Double => Self::DOUBLE_TYPE_ID,
-            Type::Integer => Self::INTEGER_TYPE_ID,
-            Type::Unit => Self::UNIT_TYPE_ID,
+            Type::Procedure { .. } | Type::Array { .. } => self.types.push(ty),
+            Type::Bool => self.bool_type(),
+            Type::Double => self.double_type(),
+            Type::Integer => self.integer_type(),
+            Type::Unit => self.unit_type(),
         }
     }
 
     pub fn get_type(&self, id: TypeId) -> &Type {
-        &self.types[id.0]
+        &self.types[id]
     }
 
     // Check if two types are equal. Note that this recursively checks for *structural* equivalence
@@ -97,8 +111,10 @@ impl<'icx> TyCtxt<'icx> {
     }
 }
 
-#[derive(Debug, PartialEq, Copy, Clone, Eq, PartialOrd, Ord)]
-pub struct DeclId(usize);
+index_vec::define_index_type! {
+    pub struct DeclId = u32;
+    MAX_INDEX = i32::max_value() as usize;
+}
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub struct Decl {
@@ -106,8 +122,10 @@ pub struct Decl {
     pub ty: TypeId,
 }
 
-#[derive(Debug, PartialEq, Copy, Clone, Eq, PartialOrd, Ord)]
-pub struct TypeId(usize);
+index_vec::define_index_type! {
+    pub struct TypeId = u32;
+    MAX_INDEX = i32::max_value() as usize;
+}
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Type {

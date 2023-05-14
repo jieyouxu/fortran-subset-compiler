@@ -1,4 +1,4 @@
-# Semantic Analysis
+# Semantic Analysis and the High-Level Intermediate Representation (HIR)
 
 We perform simple name resolution and type checking on the AST and lower it into an intermediate
 representation called the High-Level Intermediate Representation (HIR). The HIR is like the AST,

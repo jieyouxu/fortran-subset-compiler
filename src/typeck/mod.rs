@@ -4,10 +4,8 @@ use crate::session::{Diagnostic, DiagnosticKind, Session};
 use crate::span::Ident;
 use crate::types::{Decl, DeclId, TyCtxt, Type, TypeId};
 
-use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use string_interner::symbol::SymbolU32 as InternedString;
-use string_interner::StringInterner;
 use tracing::trace;
 
 pub mod hir;
@@ -27,11 +25,11 @@ enum LexicalScopeKind {
 }
 
 impl<'a> LexicalScope<'a> {
-    fn global(interner: &mut StringInterner) -> Self {
+    fn global<'tcx, 'icx>(tcx: &'tcx mut TyCtxt<'icx>) -> Self {
         Self {
             kind: LexicalScopeKind::Global,
             // Predefined decls
-            names: HashMap::from_iter([(interner.get_or_intern("DABS"), TyCtxt::DABS_DECL_ID)]),
+            names: HashMap::from_iter([(tcx.interner.get_or_intern("DABS"), tcx.dabs_decl())]),
             parent: None,
         }
     }
@@ -72,7 +70,7 @@ pub struct LowerAst<'tcx, 'sess, 'icx> {
 impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
     pub fn lower_program(&mut self, program: &Program) -> Result<hir::Program, ()> {
         let mut items = Vec::new();
-        let mut scope = LexicalScope::global(&mut self.tcx.interner);
+        let mut scope = LexicalScope::global(&mut self.tcx);
         for item in &program.items {
             items.push(self.lower_item(item, &mut scope)?);
         }
@@ -156,9 +154,9 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
 
     fn lower_ret_ty(&mut self, ret_ty: &RetTy) -> Result<TypeId, ()> {
         let ty_id = match ret_ty.kind {
-            RetTyKind::Integer => TyCtxt::INTEGER_TYPE_ID,
-            RetTyKind::Double => TyCtxt::DOUBLE_TYPE_ID,
-            RetTyKind::Unit => TyCtxt::UNIT_TYPE_ID,
+            RetTyKind::Integer => self.tcx.integer_type(),
+            RetTyKind::Double => self.tcx.double_type(),
+            RetTyKind::Unit => self.tcx.unit_type(),
         };
         Ok(ty_id)
     }
@@ -242,14 +240,14 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
     fn lower_ty_to_ty(&mut self, ty: &Ty, scope: &mut LexicalScope<'_>) -> Result<TypeId, ()> {
         let ty_id = match ty {
             Ty::Scalar(s) => match s {
-                ScalarTy::Double => TyCtxt::DOUBLE_TYPE_ID,
-                ScalarTy::Integer => TyCtxt::INTEGER_TYPE_ID,
+                ScalarTy::Double => self.tcx.double_type(),
+                ScalarTy::Integer => self.tcx.integer_type(),
             },
             Ty::Array { base, bounds } => {
                 let mut exprs = Vec::new();
                 for bound in bounds {
                     let expr = self.lower_expr(bound, scope)?;
-                    if expr.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if expr.ty != self.tcx.integer_type() {
                         self.sess.emit_diagnostic(Diagnostic {
                             kind: DiagnosticKind::NonIntegerBoundExpr,
                             message: "bound expressions must be of integer type".to_owned(),
@@ -261,8 +259,8 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 }
                 self.tcx.alloc_type(Type::Array {
                     base_ty: match base {
-                        ScalarTy::Double => TyCtxt::DOUBLE_TYPE_ID,
-                        ScalarTy::Integer => TyCtxt::INTEGER_TYPE_ID,
+                        ScalarTy::Double => self.tcx.double_type(),
+                        ScalarTy::Integer => self.tcx.integer_type(),
                     },
                     dimensions: exprs.len(),
                 })
@@ -273,9 +271,9 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
 
     fn lower_expr(&mut self, expr: &Expr, scope: &mut LexicalScope<'_>) -> Result<hir::Expr, ()> {
         let (kind, ty) = match &expr.kind {
-            ExprKind::IntConst(val) => (hir::ExprKind::IntConst(*val), TyCtxt::INTEGER_TYPE_ID),
+            ExprKind::IntConst(val) => (hir::ExprKind::IntConst(*val), self.tcx.integer_type()),
             ExprKind::DoubleConst(val) => {
-                (hir::ExprKind::DoubleConst(*val), TyCtxt::DOUBLE_TYPE_ID)
+                (hir::ExprKind::DoubleConst(*val), self.tcx.double_type())
             }
             ExprKind::Fetch(ident) => {
                 let decl = self.lower_ident(*ident, scope)?;
@@ -363,7 +361,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                         }
 
                         for arg in &args {
-                            if arg.ty != TyCtxt::INTEGER_TYPE_ID {
+                            if arg.ty != self.tcx.integer_type() {
                                 self.sess.emit_diagnostic(Diagnostic {
                                     kind: DiagnosticKind::NonIntegerIndexExpr,
                                     message: "index expressions must be of integer type".to_owned(),
@@ -387,10 +385,10 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
             ExprKind::Unary(un_op, e) => match un_op {
                 UnOp::Neg => {
                     let e = self.lower_expr(e, scope)?;
-                    if e.ty != TyCtxt::BOOL_TYPE_ID {
+                    if e.ty != self.tcx.bool_type() {
                         self.sess.emit_diagnostic(Diagnostic {
                             kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::BOOL_TYPE_ID,
+                                expected: self.tcx.bool_type(),
                                 found: e.ty,
                             },
                             message: "cannot negate a non-bool expression".to_owned(),
@@ -401,15 +399,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
 
                     (
                         hir::ExprKind::Unary(hir::UnOp::Neg, Box::new(e)),
-                        TyCtxt::BOOL_TYPE_ID,
+                        self.tcx.bool_type(),
                     )
                 }
                 UnOp::Plus => {
                     let e = self.lower_expr(e, scope)?;
-                    if e.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if e.ty != self.tcx.integer_type() {
                         self.sess.emit_diagnostic(Diagnostic {
                             kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
+                                expected: self.tcx.integer_type(),
                                 found: e.ty,
                             },
                             message: format!(
@@ -423,15 +421,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
 
                     (
                         hir::ExprKind::Unary(hir::UnOp::Plus, Box::new(e)),
-                        TyCtxt::INTEGER_TYPE_ID,
+                        self.tcx.integer_type(),
                     )
                 }
                 UnOp::Minus => {
                     let e = self.lower_expr(e, scope)?;
-                    if e.ty != TyCtxt::INTEGER_TYPE_ID {
+                    if e.ty != self.tcx.integer_type() {
                         self.sess.emit_diagnostic(Diagnostic {
                             kind: DiagnosticKind::UnexpectedType {
-                                expected: TyCtxt::INTEGER_TYPE_ID,
+                                expected: self.tcx.integer_type(),
                                 found: e.ty,
                             },
                             message: format!(
@@ -445,7 +443,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
 
                     (
                         hir::ExprKind::Unary(hir::UnOp::Minus, Box::new(e)),
-                        TyCtxt::INTEGER_TYPE_ID,
+                        self.tcx.integer_type(),
                     )
                 }
             },
@@ -453,15 +451,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Greater => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Greater, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Greater, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -495,15 +493,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Less => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Less, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Less, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -537,15 +535,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Geq => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Geq, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Geq, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -579,15 +577,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Leq => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Leq, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Leq, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -621,20 +619,20 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::And => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::And, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::And, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::BOOL_TYPE_ID && b.ty == TyCtxt::BOOL_TYPE_ID {
+                    } else if a.ty == self.tcx.bool_type() && b.ty == self.tcx.bool_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::And, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -668,20 +666,20 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Or => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Or, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Or, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::BOOL_TYPE_ID && b.ty == TyCtxt::BOOL_TYPE_ID {
+                    } else if a.ty == self.tcx.bool_type() && b.ty == self.tcx.bool_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Or, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -715,20 +713,20 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Eq => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Eq, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Eq, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::BOOL_TYPE_ID && b.ty == TyCtxt::BOOL_TYPE_ID {
+                    } else if a.ty == self.tcx.bool_type() && b.ty == self.tcx.bool_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Eq, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -762,20 +760,20 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Neq => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Neq, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Neq, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
-                    } else if a.ty == TyCtxt::BOOL_TYPE_ID && b.ty == TyCtxt::BOOL_TYPE_ID {
+                    } else if a.ty == self.tcx.bool_type() && b.ty == self.tcx.bool_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Neq, Box::new(a), Box::new(b)),
-                            TyCtxt::BOOL_TYPE_ID,
+                            self.tcx.bool_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -809,15 +807,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Add => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Add, Box::new(a), Box::new(b)),
-                            TyCtxt::INTEGER_TYPE_ID,
+                            self.tcx.integer_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Add, Box::new(a), Box::new(b)),
-                            TyCtxt::DOUBLE_TYPE_ID,
+                            self.tcx.double_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -851,15 +849,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Sub => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Sub, Box::new(a), Box::new(b)),
-                            TyCtxt::INTEGER_TYPE_ID,
+                            self.tcx.integer_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Sub, Box::new(a), Box::new(b)),
-                            TyCtxt::DOUBLE_TYPE_ID,
+                            self.tcx.double_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -893,15 +891,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Mul => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Mul, Box::new(a), Box::new(b)),
-                            TyCtxt::INTEGER_TYPE_ID,
+                            self.tcx.integer_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Mul, Box::new(a), Box::new(b)),
-                            TyCtxt::DOUBLE_TYPE_ID,
+                            self.tcx.double_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -935,15 +933,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Div => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Div, Box::new(a), Box::new(b)),
-                            TyCtxt::INTEGER_TYPE_ID,
+                            self.tcx.integer_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Div, Box::new(a), Box::new(b)),
-                            TyCtxt::DOUBLE_TYPE_ID,
+                            self.tcx.double_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -977,15 +975,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                 BinOp::Mod => {
                     let a = self.lower_expr(a, scope)?;
                     let b = self.lower_expr(b, scope)?;
-                    if a.ty == TyCtxt::INTEGER_TYPE_ID && b.ty == TyCtxt::INTEGER_TYPE_ID {
+                    if a.ty == self.tcx.integer_type() && b.ty == self.tcx.integer_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Mod, Box::new(a), Box::new(b)),
-                            TyCtxt::INTEGER_TYPE_ID,
+                            self.tcx.integer_type(),
                         )
-                    } else if a.ty == TyCtxt::DOUBLE_TYPE_ID && b.ty == TyCtxt::DOUBLE_TYPE_ID {
+                    } else if a.ty == self.tcx.double_type() && b.ty == self.tcx.double_type() {
                         (
                             hir::ExprKind::Binary(hir::BinOp::Mod, Box::new(a), Box::new(b)),
-                            TyCtxt::DOUBLE_TYPE_ID,
+                            self.tcx.double_type(),
                         )
                     } else if a.ty != b.ty {
                         self.sess.emit_diagnostic(Diagnostic {
@@ -1299,7 +1297,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
                         }
 
                         for arg in &args {
-                            if arg.ty != TyCtxt::INTEGER_TYPE_ID {
+                            if arg.ty != self.tcx.integer_type() {
                                 self.sess.emit_diagnostic(Diagnostic {
                                     kind: DiagnosticKind::NonIntegerIndexExpr,
                                     message: "index expressions must be of integer type".to_owned(),
@@ -1348,15 +1346,15 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
         scope: &mut LexicalScope<'_>,
     ) -> Result<hir::IfStmt, ()> {
         let cond = self.lower_expr(&if_stmt.cond, scope)?;
-        if cond.ty != TyCtxt::BOOL_TYPE_ID {
+        if cond.ty != self.tcx.bool_type() {
             self.sess.emit_diagnostic(Diagnostic {
                 kind: DiagnosticKind::UnexpectedType {
-                    expected: TyCtxt::BOOL_TYPE_ID,
+                    expected: self.tcx.bool_type(),
                     found: cond.ty,
                 },
                 message: format!(
                     "expected `{:?}` type, found `{:?}` type",
-                    self.tcx.get_type(TyCtxt::BOOL_TYPE_ID),
+                    self.tcx.get_type(self.tcx.bool_type()),
                     self.tcx.get_type(cond.ty)
                 ),
                 span: cond.span,

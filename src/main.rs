@@ -3,6 +3,7 @@
 
 mod ast;
 mod lex;
+mod mir;
 mod parse;
 mod session;
 mod span;
