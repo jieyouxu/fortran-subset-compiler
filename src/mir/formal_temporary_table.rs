@@ -1,12 +1,21 @@
 use std::collections::BTreeMap;
 
+use ordered_float::OrderedFloat;
+
 use super::{Opcode, TemporaryId};
 
 /// The formal temporary table stores records of opcode and inputs for each instruction alongside
 /// the temporary for the result.
 #[derive(Debug, PartialEq)]
 pub struct FormalTemporaryTable {
-    records: BTreeMap<(Opcode, Vec<TemporaryId>), TemporaryId>,
+    records: BTreeMap<(Opcode, Vec<TempOrConst>), TemporaryId>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord)]
+pub enum TempOrConst {
+    Temp(TemporaryId),
+    IntConst(i64),
+    DoubleConst(OrderedFloat<f64>),
 }
 
 impl FormalTemporaryTable {
@@ -16,11 +25,11 @@ impl FormalTemporaryTable {
         }
     }
 
-    pub fn lookup(&self, key: &(Opcode, Vec<TemporaryId>)) -> Option<TemporaryId> {
+    pub fn lookup(&self, key: &(Opcode, Vec<TempOrConst>)) -> Option<TemporaryId> {
         self.records.get(key).copied()
     }
 
-    pub fn insert(&mut self, key: (Opcode, Vec<TemporaryId>), temp: TemporaryId) {
+    pub fn insert(&mut self, key: (Opcode, Vec<TempOrConst>), temp: TemporaryId) {
         self.insert(key, temp)
     }
 }

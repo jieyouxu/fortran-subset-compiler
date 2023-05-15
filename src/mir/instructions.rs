@@ -4,7 +4,7 @@ use super::{BasicBlockId, TemporaryId};
 #[derive(Debug, PartialEq)]
 pub enum Instruction {
     /// Load constant `c` into temporary `dst`.
-    ILDC { c: Const, dst: TemporaryId },
+    ILDC { c: i64, dst: TemporaryId },
     /// Copy integer temporary `src` into `dst`.
     I2I { src: TemporaryId, dst: TemporaryId },
     /// Load integer from memory location `src` into `dst`.
@@ -41,6 +41,8 @@ pub enum Instruction {
     },
     /// Store value `src` into integer location `dst`.
     ISST { src: TemporaryId, dst: TemporaryId },
+    /// Load constant `d` into temporary `dst`.
+    DLDC { c: f64, dst: TemporaryId },
     /// Load double in address `src` into temporary `dst`.
     DSLD { src: TemporaryId, dst: TemporaryId },
     /// Store value in double temporary `src` into address `dst`.
@@ -61,6 +63,24 @@ pub enum Instruction {
     },
     /// Copy value from `src` into `dst.
     D2D { src: TemporaryId, dst: TemporaryId },
+    /// Double `dst` = `t1` - `t2`.
+    DSUB {
+        t1: TemporaryId,
+        t2: TemporaryId,
+        dst: TemporaryId,
+    },
+    /// Double `dst` = `t1` * `t2`.
+    DMUL {
+        t1: TemporaryId,
+        t2: TemporaryId,
+        dst: TemporaryId,
+    },
+    /// Double `dst` = `t1` + `t2`.
+    DADD {
+        t1: TemporaryId,
+        t2: TemporaryId,
+        dst: TemporaryId,
+    },
     /// Unconditionally branch to `target_block`.
     BR { target_block: BasicBlockId },
 }
@@ -82,13 +102,11 @@ pub enum Opcode {
     DCMPLE,
     DBCOND,
     D2D,
+    DLDC,
+    DSUB,
+    DMUL,
+    DADD,
     BR,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Const {
-    Integer(i64),
-    Double(f64),
 }
 
 impl Instruction {
@@ -110,6 +128,10 @@ impl Instruction {
             Instruction::DBCOND { .. } => Opcode::DBCOND,
             Instruction::D2D { .. } => Opcode::D2D,
             Instruction::BR { .. } => Opcode::BR,
+            Instruction::DLDC { .. } => Opcode::DLDC,
+            Instruction::DSUB { .. } => Opcode::DSUB,
+            Instruction::DMUL { .. } => Opcode::DMUL,
+            Instruction::DADD { .. } => Opcode::DADD,
         }
     }
 
@@ -131,6 +153,10 @@ impl Instruction {
             Instruction::DBCOND { .. } => vec![].into_iter(),
             Instruction::D2D { dst, .. } => vec![*dst].into_iter(),
             Instruction::BR { .. } => vec![].into_iter(),
+            Instruction::DLDC { dst, .. } => vec![*dst].into_iter(),
+            Instruction::DSUB { dst, .. } => vec![*dst].into_iter(),
+            Instruction::DMUL { dst, .. } => vec![*dst].into_iter(),
+            Instruction::DADD { dst, .. } => vec![*dst].into_iter(),
         }
     }
 }

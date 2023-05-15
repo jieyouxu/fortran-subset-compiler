@@ -2,13 +2,17 @@ pub mod formal_temporary_table;
 pub mod instructions;
 pub mod walk;
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use index_vec::IndexVec;
 
 use formal_temporary_table::FormalTemporaryTable;
-use instructions::{Const, Instruction, Opcode};
+use instructions::{Instruction, Opcode};
+use ordered_float::OrderedFloat;
+
+use crate::types::TyCtxt;
+
+use self::formal_temporary_table::TempOrConst;
 
 index_vec::define_index_type! {
     pub struct BasicBlockId = u32;
@@ -135,7 +139,8 @@ impl MirArena {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct FlowGraphBuilder<'a> {
+pub struct FlowGraphBuilder<'tcx, 'icx, 'a> {
+    pub tcx: &'tcx mut TyCtxt<'icx>,
     pub arena: &'a mut MirArena,
     pub basic_blocks: BTreeSet<BasicBlockId>,
     pub temporaries: BTreeSet<TemporaryId>,
@@ -149,7 +154,7 @@ pub struct GlobalMetadata {
     pub killed: BTreeMap<BasicBlockId, BTreeSet<TemporaryId>>,
 }
 
-impl<'a> FlowGraphBuilder<'a> {
+impl<'tcx, 'icx, 'a> FlowGraphBuilder<'tcx, 'icx, 'a> {
     pub fn compute_local(&mut self) {
         for bb_id in self.basic_blocks.iter() {
             self.arena
@@ -161,11 +166,12 @@ impl<'a> FlowGraphBuilder<'a> {
     /// Create an empty flow graph. We construct two basic blocks: `Entry` and `Exit`, which are the
     /// start and exit blocks for the flow graph. The `Entry` block is set as the current block such
     /// that initial instructions are added to the block.
-    pub fn initialize_graph(arena: &'a mut MirArena) -> Self {
+    pub fn initialize_graph(tcx: &'tcx mut TyCtxt<'icx>, arena: &'a mut MirArena) -> Self {
         let entry = arena.alloc_basic_block(BasicBlock::default());
         let exit = arena.alloc_basic_block(BasicBlock::default());
 
         Self {
+            tcx,
             arena,
             basic_blocks: BTreeSet::from_iter([entry, exit]),
             temporaries: Default::default(),
@@ -188,7 +194,7 @@ impl<'a> FlowGraphBuilder<'a> {
         self.current_block = block;
     }
 
-    pub fn new_temporary(&mut self, kind: TemporaryKind) -> TemporaryId {
+    fn new_temporary(&mut self, kind: TemporaryKind) -> TemporaryId {
         self.arena.alloc_temporary(Temporary::new(kind))
     }
 
@@ -197,85 +203,65 @@ impl<'a> FlowGraphBuilder<'a> {
         current_block.instructions.push(ins);
     }
 
-    pub fn ildc_instruct(&mut self, c: Const, dst: TemporaryId) {
+    pub(crate) fn binary_instruct(
+        &mut self,
+        opcode: Opcode,
+        t1: TemporaryId,
+        t2: TemporaryId,
+    ) -> TemporaryId {
+        let key = (opcode, vec![TempOrConst::Temp(t1), TempOrConst::Temp(t2)]);
+        let dst = if let Some(dst) = self.formal_temporary_table.lookup(&key) {
+            dst
+        } else {
+            let new_temp = self.new_temporary(TemporaryKind::Expression);
+            self.formal_temporary_table.insert(key, new_temp);
+            new_temp
+        };
+
+        let ins = match opcode {
+            Opcode::ISUB => Instruction::ISUB { t1, t2, dst },
+            Opcode::IMUL => Instruction::IMUL { t1, t2, dst },
+            Opcode::IADD => Instruction::IADD { t1, t2, dst },
+            Opcode::DSUB => Instruction::DSUB { t1, t2, dst },
+            Opcode::DMUL => Instruction::DMUL { t1, t2, dst },
+            Opcode::DADD => Instruction::DADD { t1, t2, dst },
+            _ => unreachable!(),
+        };
+        self.insert_instruction(ins);
+
+        dst
+    }
+
+    pub(crate) fn int_const_instruct(&mut self, c: i64) -> TemporaryId {
+        let key = (Opcode::ILDC, vec![TempOrConst::IntConst(c)]);
+        let dst = if let Some(dst) = self.formal_temporary_table.lookup(&key) {
+            dst
+        } else {
+            let new_temp = self.new_temporary(TemporaryKind::Expression);
+            self.formal_temporary_table.insert(key, new_temp);
+            new_temp
+        };
+
         self.insert_instruction(Instruction::ILDC { c, dst });
+
+        dst
     }
 
-    pub fn i2i_instruct(&mut self, src: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::I2I { src, dst });
-    }
+    pub(crate) fn double_const_instruct(&mut self, c: f64) -> TemporaryId {
+        let key = (
+            Opcode::DLDC,
+            vec![TempOrConst::DoubleConst(OrderedFloat(c))],
+        );
+        let dst = if let Some(dst) = self.formal_temporary_table.lookup(&key) {
+            dst
+        } else {
+            let new_temp = self.new_temporary(TemporaryKind::Expression);
+            self.formal_temporary_table.insert(key, new_temp);
+            new_temp
+        };
 
-    pub fn isld_instruct(&mut self, src: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::ISLD { src, dst });
-    }
+        self.insert_instruction(Instruction::DLDC { c, dst });
 
-    pub fn icmpgt_instruct(&mut self, t1: TemporaryId, t2: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::ICMPGT { t1, t2, dst });
-    }
-
-    pub fn isub_instruct(&mut self, t1: TemporaryId, t2: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::ISUB { t1, t2, dst });
-    }
-
-    pub fn imul_instruct(&mut self, t1: TemporaryId, t2: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::ISUB { t1, t2, dst });
-    }
-
-    pub fn iadd_instruct(&mut self, t1: TemporaryId, t2: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::ISUB { t1, t2, dst });
-    }
-
-    pub fn isst_instruct(&mut self, src: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::ISST { src, dst });
-    }
-
-    pub fn dsld_instruct(&mut self, src: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::DSLD { src, dst });
-    }
-
-    pub fn dsst_instruct(&mut self, src: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::DSST { src, dst });
-    }
-
-    pub fn dabs_instruct(&mut self, src: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::DABS { src, dst });
-    }
-
-    pub fn dcmple_instruct(&mut self, sf1: TemporaryId, sf2: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::DCMPLE { sf1, sf2, dst });
-    }
-
-    pub fn d2d_instruct(&mut self, src: TemporaryId, dst: TemporaryId) {
-        self.insert_instruction(Instruction::D2D { src, dst });
-    }
-
-    pub fn ibcond_instruct(
-        &mut self,
-        cond: TemporaryId,
-        true_block: BasicBlockId,
-        false_block: BasicBlockId,
-    ) {
-        self.insert_instruction(Instruction::IBCOND {
-            cond,
-            true_block,
-            false_block,
-        });
-    }
-
-    pub fn dbcond_instruct(
-        &mut self,
-        cond: TemporaryId,
-        true_block: BasicBlockId,
-        false_block: BasicBlockId,
-    ) {
-        self.insert_instruction(Instruction::DBCOND {
-            cond,
-            true_block,
-            false_block,
-        });
-    }
-
-    pub fn br_instruct(&mut self, target_block: BasicBlockId) {
-        self.insert_instruction(Instruction::BR { target_block });
+        dst
     }
 }
