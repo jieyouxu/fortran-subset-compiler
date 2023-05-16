@@ -147,6 +147,7 @@ pub struct FlowGraphBuilder<'tcx, 'icx, 'a> {
     pub formal_temporary_table: FormalTemporaryTable,
     pub current_block: BasicBlockId,
     pub global_metadata: GlobalMetadata,
+    pub break_stack: Vec<BasicBlockId>,
 }
 
 #[derive(Debug, PartialEq, Default)]
@@ -180,6 +181,7 @@ impl<'tcx, 'icx, 'a> FlowGraphBuilder<'tcx, 'icx, 'a> {
             global_metadata: GlobalMetadata {
                 killed: Default::default(),
             },
+            break_stack: Default::default(),
         }
     }
 

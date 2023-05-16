@@ -49,8 +49,9 @@ pub enum StmtKind {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct DoLoop {
-    pub lower_bound: Expr,
-    pub upper_bound: Expr,
+    pub var: DeclId,
+    pub start: Expr,
+    pub end: Expr,
     pub step: Option<Expr>,
     pub stmts: Vec<Stmt>,
     pub span: Span,

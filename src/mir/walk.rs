@@ -1,5 +1,6 @@
 use super::instructions::Opcode;
 use super::{BasicBlockId, FlowGraphBuilder, TemporaryId};
+use crate::span::Span;
 use crate::types::hir::*;
 use crate::types::*;
 
@@ -46,8 +47,100 @@ impl<'tcx, 'icx, 'a> FlowGraphBuilder<'tcx, 'icx, 'a> {
     /// No value context: when subtree is a statement or expression used as statement, we walk the
     /// subtree creating instructions to represent the effect of the subtree without creating a
     /// temporary to hold any final value.
-    pub fn novalue_walk_program(&mut self, program: &Program) {
-        todo!()
+    pub fn novalue_walk_stmt(&mut self, stmt: &Stmt) {
+        match &stmt.kind {
+            // For a do loop that has the form:
+            //
+            // DO VAR = START, END, STEP
+            //     STMTS
+            // END DO
+            //
+            // We lower into IR as if it was
+            //
+            // VAR = START
+            // WHILE VAR OP END
+            //     STMTS
+            //     VAR += STEP
+            // END WHILE
+            StmtKind::DoLoop(do_loop) => {
+                let var_expr = Expr {
+                    kind: ExprKind::Fetch(do_loop.var),
+                    span: do_loop.span,
+                    ty: self.tcx.get_decl(do_loop.var).ty,
+                };
+
+                let initial_assign = Stmt {
+                    kind: StmtKind::Assign(Assign {
+                        lhs: var_expr.clone(),
+                        rhs: do_loop.start.clone(),
+                        span: do_loop.start.span,
+                    }),
+                    span: Span::dummy(),
+                };
+
+                self.novalue_walk_stmt(&initial_assign);
+
+                let cond_expr = Expr {
+                    kind: match do_loop.step {
+                        Some(_) => todo!(),
+                        None => ExprKind::Binary(
+                            BinOp::Leq,
+                            Box::new(var_expr.clone()),
+                            Box::new(do_loop.end.clone()),
+                        ),
+                    },
+                    span: Span::dummy(),
+                    ty: self.tcx.bool_type(),
+                };
+
+                let after = self.create_block();
+                let body = self.create_block();
+
+                self.break_stack.push(after);
+
+                self.flow_walk(&cond_expr, body, after);
+
+                self.start_block(body);
+
+                let update_step_stmt = Stmt {
+                    kind: StmtKind::Assign(Assign {
+                        lhs: var_expr.clone(),
+                        rhs: Expr {
+                            kind: ExprKind::Binary(
+                                BinOp::Add,
+                                Box::new(var_expr),
+                                Box::new(do_loop.step.clone().unwrap_or(Expr {
+                                    kind: ExprKind::IntConst(1),
+                                    span: Span::dummy(),
+                                    ty: self.tcx.integer_type(),
+                                })),
+                            ),
+                            span: Span::dummy(),
+                            ty: self.tcx.integer_type(),
+                        },
+                        span: Span::dummy(),
+                    }),
+                    span: Span::dummy(),
+                };
+
+                let mut body_stmts = do_loop.stmts.clone();
+                body_stmts.push(update_step_stmt);
+
+                for stmt in body_stmts {
+                    self.novalue_walk_stmt(&stmt);
+                }
+
+                self.flow_walk(&cond_expr, body, after);
+
+                self.start_block(after);
+
+                self.break_stack.pop();
+            }
+            StmtKind::Assign(assign) => {
+                todo!()
+            }
+            StmtKind::If(if_stmt) => todo!(),
+        }
     }
 
     /// Flow value context: if subtree represents an expression used to determine branching

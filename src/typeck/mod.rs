@@ -1201,6 +1201,7 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
         do_loop: &DoLoop,
         scope: &mut LexicalScope<'_>,
     ) -> Result<hir::DoLoop, ()> {
+        let var = self.lower_ident(do_loop.ident, scope)?;
         let lower_bound = self.lower_expr(&do_loop.lower_bound, scope)?;
         let upper_bound = self.lower_expr(&do_loop.upper_bound, scope)?;
         let step = do_loop
@@ -1216,8 +1217,9 @@ impl<'tcx, 'sess, 'icx> LowerAst<'tcx, 'sess, 'icx> {
         let stmts = self.lower_stmts(&do_loop.stmts, &mut loop_scope)?;
 
         Ok(hir::DoLoop {
-            lower_bound,
-            upper_bound,
+            var,
+            start: lower_bound,
+            end: upper_bound,
             step,
             stmts,
             span: do_loop.span,
